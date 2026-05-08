@@ -1,4 +1,8 @@
-//  g++ -O3 -march=native test.cpp -o pohlig_hellman -lgmpxx -lgmp -pthread
+//  g++ -O3 -march=native -funroll-loops -ffast-math \
+    test.cpp -o pohlig_hellman \
+    -lgmpxx -lgmp -lpthread -ltbb
+
+
 #include <iostream>
 #include <fstream>
 #include <stdexcept>
@@ -10,6 +14,7 @@
 #include <random>
 #include <gmp.h>
 #include <atomic>
+#include <chrono>
 
 
 using namespace std;
@@ -97,7 +102,6 @@ void add_points(Point& res, const Point& P1, const Point& P2, ThreadMathContext&
     if (P1.is_infinity) { res.set(P2); return; }
     if (P2.is_infinity) { res.set(P1); return; }
 
-
     if (mpz_cmp(P1.x, P2.x) == 0) {
         if (mpz_cmp(P1.y, P2.y) != 0 || mpz_cmp_ui(P1.y, 0) == 0) {
             res.is_infinity = true;
@@ -125,20 +129,15 @@ void add_points(Point& res, const Point& P1, const Point& P2, ThreadMathContext&
         throw runtime_error("No inverse found in point addition");
     }
 
-
-
-
     mpz_mul(ctx.tmp_m, ctx.tmp_num, ctx.tmp_den);
     mpz_mod(ctx.tmp_m, ctx.tmp_m, curve_p);
 
-    // rx = m^2 - P.x - Q.x
     mpz_mul(ctx.tmp_rx, ctx.tmp_m, ctx.tmp_m);
     mpz_sub(ctx.tmp_rx, ctx.tmp_rx, P1.x);
     mpz_sub(ctx.tmp_rx, ctx.tmp_rx, P2.x);
     mpz_mod(ctx.tmp_rx, ctx.tmp_rx, curve_p);
     if (mpz_sgn(ctx.tmp_rx) < 0) mpz_add(ctx.tmp_rx, ctx.tmp_rx, curve_p);
 
-    // ry = m*(P.x - rx) - P.y
     mpz_sub(ctx.tmp_diff, P1.x, ctx.tmp_rx);
     mpz_mul(ctx.tmp_ry, ctx.tmp_m, ctx.tmp_diff);
     mpz_sub(ctx.tmp_ry, ctx.tmp_ry, P1.y);
@@ -148,16 +147,19 @@ void add_points(Point& res, const Point& P1, const Point& P2, ThreadMathContext&
     mpz_set(res.x, ctx.tmp_rx);
     mpz_set(res.y, ctx.tmp_ry);
     res.is_infinity = false;
-
 }
 
+
+
 void multiply_point(Point& res, const Point& P, const mpz_t k, ThreadMathContext& ctx) {
-    Point R, tempP;
+    Point R;     
+    Point tempP;
+
+
     tempP.set(P);
-    
     size_t bits = mpz_sizeinbase(k, 2);
     for (int i = bits - 1; i >= 0; --i) {
-        add_points(R, R, R, ctx);
+        if (!R.is_infinity) add_points(R, R, R, ctx); 
         if (mpz_tstbit(k, i)) {
             add_points(R, R, tempP, ctx);
         }
@@ -190,7 +192,7 @@ void next_step_thread_safe(Point& P, mpz_t& a, mpz_t& b, ThreadMathContext& ctx)
 
 bool is_distinguished(const Point& P) {
     if (P.is_infinity) return false;
-    unsigned long mask = 0xFFFFF; // 20 bit
+    unsigned long mask = 0xFFFFFF; // 24 bit
     return (mpz_get_ui(P.x) & mask) == 0;
 }
 
@@ -208,7 +210,7 @@ void monitor_thread() {
     auto start_time = chrono::steady_clock::now();
     
     while (!key_found) {
-        this_thread::sleep_for(chrono::milliseconds(500));
+        this_thread::sleep_for(chrono::milliseconds(5000));
         if (key_found) break;
 
         auto now = chrono::steady_clock::now();
@@ -235,7 +237,6 @@ void worker_thread(int thread_id) {
     mpz_t a, b, a_col, b_col, r, r_inv, num;
     mpz_inits(a, b, a_col, b_col, r, r_inv, num, NULL);
 
-    // Уникальный сид для потока
     random_device rd;
     unsigned long seed = rd() ^ (thread_id * 1000) ^ time(NULL);
     gmp_randstate_t rand_state;
@@ -247,7 +248,7 @@ void worker_thread(int thread_id) {
 
 
     while (!key_found) {
-        // 1. Прыгаем в случайную точку: P = a*G + b*Q
+        // random point P = a*G + b*Q
         mpz_urandomm(a, rand_state, group_order);
         mpz_urandomm(b, rand_state, group_order);
         
@@ -258,7 +259,6 @@ void worker_thread(int thread_id) {
         multiply_point(bQ, Q, b, ctx);
         add_points(P, aG, bQ, ctx);
 
-        // 2. Блуждаем, пока не найдем отличимую точку
         while (!key_found) {
             next_step_thread_safe(P, a, b, ctx);
             
@@ -276,13 +276,12 @@ void worker_thread(int thread_id) {
 
 
                 lock_guard<mutex> lock(db_mutex);
-                if (key_found) break; // Кто-то другой уже нашел ключ
+                if (key_found) break; 
 
                 char* x_str = mpz_get_str(NULL, 16, P.x);
                 string hash_key(x_str);
                 
                 if (dp_table.count(hash_key)) {
-                    // КОЛЛИЗИЯ НАЙДЕНА!
                     mpz_set_str(a_col, dp_table[hash_key].first.c_str(), 16);
                     mpz_set_str(b_col, dp_table[hash_key].second.c_str(), 16);
 
@@ -306,19 +305,20 @@ void worker_thread(int thread_id) {
                         key_found = true;
                     }
                 } else {
-                    // Новая точка — сохраняем
                     char* a_str = mpz_get_str(NULL, 16, a);
                     char* b_str = mpz_get_str(NULL, 16, b);
                     
                     dp_table[hash_key] = {a_str, b_str};
                     save_file << hash_key << " " << a_str << " " << b_str << "\n";
-                    save_file.flush(); // Важно! Сразу пишем на диск
+                    
+                    if (dp_table.size() % 100 == 0) {
+                        save_file.flush(); 
+                    }
                     
                     free(a_str); free(b_str);
                 }
                 free(x_str);
                 
-                // Начинаем новый случайный путь
                 break; 
             }
         }
@@ -389,7 +389,9 @@ int main() {
         cout << "=========================================\n";
     }
 
+    save_file.flush();
     save_file.close();
+
     mpz_clears(curve_a, curve_b, curve_p, group_order, final_secret_key, NULL);
     return 0;
 
