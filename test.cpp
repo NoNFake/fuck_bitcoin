@@ -5,16 +5,15 @@
 
 #include <iostream>
 #include <fstream>
-#include <stdexcept>
 #include <vector>
 #include <thread>
 #include <mutex>
 #include <unordered_map>
-#include <string>
 #include <random>
-#include <gmp.h>
 #include <atomic>
 #include <chrono>
+#include <gmp.h>
+
 
 
 using namespace std;
@@ -28,371 +27,287 @@ void init_curve(const char* a, const char* b, const char* p) {
 
 
 
-// ── Арифметика на эллиптической кривой ──
+
 struct Point {
     mpz_t x, y;
     bool is_infinity;
 
+    Point()                  { mpz_inits(x, y, NULL); is_infinity = true; }
+    ~Point()                 { mpz_clears(x, y, NULL); }
 
-    Point() {
-        mpz_init(x);
-        mpz_init(y);
-
-        is_infinity = true;
+    void set(const Point& o) {
+        mpz_set(x, o.x); mpz_set(y, o.y);
+        is_infinity = o.is_infinity;
     }
-
-    ~Point() {
-        mpz_clear(x);
-        mpz_clear(y);
-    }
-
-
-    void set(const Point& other) {
-        mpz_set(x, other.x);
-        mpz_set(y, other.y);
-        is_infinity = other.is_infinity;
-    }
-
-
-
-    void set_str(const char* x_str, const char* y_str) {
-        mpz_set_str(x, x_str, 10);
-        mpz_set_str(y, y_str, 10);
+    void set_str(const char* xs, const char* ys) {
+        mpz_set_str(x, xs, 10);
+        mpz_set_str(y, ys, 10);
         is_infinity = false;
     }
-
-
-    bool equals(const Point& other) const {
-        if (is_infinity && other.is_infinity) return true;
-        if (is_infinity || other.is_infinity) return false;
-        return mpz_cmp(x, other.x) == 0 && mpz_cmp(y, other.y) == 0;
+    bool equals(const Point& o) const {
+        if (is_infinity && o.is_infinity) return true;
+        if (is_infinity || o.is_infinity)  return false;
+        return mpz_cmp(x, o.x) == 0 && mpz_cmp(y, o.y) == 0;
     }
-
 };
-
 
 Point G, Q;
 
-
-struct ThreadMathContext {
-    mpz_t tmp_num, tmp_den, tmp_m, tmp_rx, tmp_ry, tmp_diff, subset;
-
-    ThreadMathContext() {
-        mpz_inits(tmp_num, tmp_den, tmp_m, tmp_rx, tmp_ry, tmp_diff, subset, NULL);
-    }
-    
-    ~ThreadMathContext() {
-        mpz_clears(tmp_num, tmp_den, tmp_m, tmp_rx, tmp_ry, tmp_diff, subset, NULL);
-    }
+struct Ctx {
+    mpz_t num, den, m, rx, ry, diff, sub;
+    Ctx()  { mpz_inits(num, den, m, rx, ry, diff, sub, NULL); }
+    ~Ctx() { mpz_clears(num, den, m, rx, ry, diff, sub, NULL); }
 };
 
 
 
 
-// mpz_t tmp_num, tmp_den, tmp_m, tmp_rx, tmp_ry, tmp_diff;
+inline void point_add(Point& R, const Point& P, const Point& Pq, Ctx& c) {
+    if (P.is_infinity)  { R.set(Pq); return; }
+    if (Pq.is_infinity) { R.set(P);  return; }
 
 
-// void init_math(){
-//     mpz_inits(tmp_num, tmp_den, tmp_m, tmp_rx, tmp_ry, tmp_diff, NULL);
-// }
+    if (mpz_cmp(P.x, Pq.x) == 0) {
+        if (mpz_cmp(P.y, Pq.y) != 0 || mpz_sgn(P.y) == 0)
+            { R.is_infinity = true; return; }
 
-
-
-void add_points(Point& res, const Point& P1, const Point& P2, ThreadMathContext& ctx) {
-    if (P1.is_infinity) { res.set(P2); return; }
-    if (P2.is_infinity) { res.set(P1); return; }
-
-    if (mpz_cmp(P1.x, P2.x) == 0) {
-        if (mpz_cmp(P1.y, P2.y) != 0 || mpz_cmp_ui(P1.y, 0) == 0) {
-            res.is_infinity = true;
-            return;
-        }
-
-        mpz_mul(ctx.tmp_num, P1.x, P1.x);
-        mpz_mod(ctx.tmp_num, ctx.tmp_num, curve_p);
-        mpz_mul_ui(ctx.tmp_num, ctx.tmp_num, 3);
-        mpz_add(ctx.tmp_num, ctx.tmp_num, curve_a);
-        mpz_mod(ctx.tmp_num, ctx.tmp_num, curve_p);
-
-        mpz_mul_ui(ctx.tmp_den, P1.y, 2);
-        mpz_mod(ctx.tmp_den, ctx.tmp_den, curve_p);
-
+        mpz_mul(c.num, P.x, P.x); mpz_mod(c.num, c.num, curve_p);
+        mpz_mul_ui(c.num, c.num, 3);
+        mpz_add(c.num, c.num, curve_a);
+        mpz_mod(c.num, c.num, curve_p);
+        mpz_mul_ui(c.den, P.y, 2);
+        mpz_mod(c.den, c.den, curve_p);
     } else {
-        mpz_sub(ctx.tmp_num, P2.y, P1.y);
-        mpz_mod(ctx.tmp_num, ctx.tmp_num, curve_p);
-        
-        mpz_sub(ctx.tmp_den, P2.x, P1.x);
-        mpz_mod(ctx.tmp_den, ctx.tmp_den, curve_p);
+
+        mpz_sub(c.num, Pq.y, P.y); mpz_mod(c.num, c.num, curve_p);
+        mpz_sub(c.den, Pq.x, P.x); mpz_mod(c.den, c.den, curve_p);
     }
 
-    if (mpz_invert(ctx.tmp_den, ctx.tmp_den, curve_p) == 0) {
-        throw runtime_error("No inverse found in point addition");
-    }
 
-    mpz_mul(ctx.tmp_m, ctx.tmp_num, ctx.tmp_den);
-    mpz_mod(ctx.tmp_m, ctx.tmp_m, curve_p);
+    mpz_invert(c.den, c.den, curve_p);   
+    mpz_mul(c.m, c.num, c.den); mpz_mod(c.m, c.m, curve_p);
 
-    mpz_mul(ctx.tmp_rx, ctx.tmp_m, ctx.tmp_m);
-    mpz_sub(ctx.tmp_rx, ctx.tmp_rx, P1.x);
-    mpz_sub(ctx.tmp_rx, ctx.tmp_rx, P2.x);
-    mpz_mod(ctx.tmp_rx, ctx.tmp_rx, curve_p);
-    if (mpz_sgn(ctx.tmp_rx) < 0) mpz_add(ctx.tmp_rx, ctx.tmp_rx, curve_p);
+    mpz_mul(c.rx, c.m, c.m); mpz_sub(c.rx, c.rx, P.x); mpz_sub(c.rx, c.rx, Pq.x);
+    mpz_mod(c.rx, c.rx, curve_p);
+    if (mpz_sgn(c.rx) < 0) mpz_add(c.rx, c.rx, curve_p);
 
-    mpz_sub(ctx.tmp_diff, P1.x, ctx.tmp_rx);
-    mpz_mul(ctx.tmp_ry, ctx.tmp_m, ctx.tmp_diff);
-    mpz_sub(ctx.tmp_ry, ctx.tmp_ry, P1.y);
-    mpz_mod(ctx.tmp_ry, ctx.tmp_ry, curve_p);
-    if (mpz_sgn(ctx.tmp_ry) < 0) mpz_add(ctx.tmp_ry, ctx.tmp_ry, curve_p);
+    mpz_sub(c.diff, P.x, c.rx);
+    mpz_mul(c.ry, c.m, c.diff); mpz_sub(c.ry, c.ry, P.y);
+    mpz_mod(c.ry, c.ry, curve_p);
+    if (mpz_sgn(c.ry) < 0) mpz_add(c.ry, c.ry, curve_p);
 
-    mpz_set(res.x, ctx.tmp_rx);
-    mpz_set(res.y, ctx.tmp_ry);
-    res.is_infinity = false;
+    mpz_set(R.x, c.rx); mpz_set(R.y, c.ry);
+    R.is_infinity = false;
 }
 
-
-
-void multiply_point(Point& res, const Point& P, const mpz_t k, ThreadMathContext& ctx) {
-    Point R;     
-    Point tempP;
-
-
-    tempP.set(P);
+void point_mul(Point& R, const Point& P, const mpz_t k, Ctx& c) {
+    Point tmp; tmp.set(P);
     size_t bits = mpz_sizeinbase(k, 2);
-    for (int i = bits - 1; i >= 0; --i) {
-        if (!R.is_infinity) add_points(R, R, R, ctx); 
-        if (mpz_tstbit(k, i)) {
-            add_points(R, R, tempP, ctx);
-        }
-    }
-    res.set(R);
-}
-
-
-void next_step_thread_safe(Point& P, mpz_t& a, mpz_t& b, ThreadMathContext& ctx) {
-    if (P.is_infinity) return;
-    
-    mpz_fdiv_r_ui(ctx.subset, P.x, 3); 
-    unsigned long s = mpz_get_ui(ctx.subset);
-
-    if (s == 0) {
-        mpz_add_ui(a, a, 1);
-        mpz_mod(a, a, group_order);
-        add_points(P, P, G, ctx);
-    } else if (s == 1) {
-        mpz_mul_ui(a, a, 2); mpz_mod(a, a, group_order);
-        mpz_mul_ui(b, b, 2); mpz_mod(b, b, group_order);
-        add_points(P, P, P, ctx);
-    } else {
-        mpz_add_ui(b, b, 1);
-        mpz_mod(b, b, group_order);
-        add_points(P, P, Q, ctx);
+    for (int i = (int)bits - 1; i >= 0; --i) {
+        if (!R.is_infinity) point_add(R, R, R, c);   // double
+        if (mpz_tstbit(k, i)) point_add(R, R, tmp, c); // add
     }
 }
 
 
-bool is_distinguished(const Point& P) {
-    if (P.is_infinity) return false;
-    unsigned long mask = 0xFFFFFF; // 24 bit
-    return (mpz_get_ui(P.x) & mask) == 0;
+
+inline void walk_step(Point& P, mpz_t& a, mpz_t& b, Ctx& c) {
+    mpz_fdiv_r_ui(c.sub, P.x, 3);
+    switch (mpz_get_ui(c.sub)) {
+        case 0:  // P += G,  a += 1
+            mpz_add_ui(a, a, 1); mpz_mod(a, a, group_order);
+            point_add(P, P, G, c);
+            break;
+        case 1:  // P *= 2,  a *= 2, b *= 2
+            mpz_mul_ui(a, a, 2); mpz_mod(a, a, group_order);
+            mpz_mul_ui(b, b, 2); mpz_mod(b, b, group_order);
+            point_add(P, P, P, c);
+            break;
+        default: // P += Q,  b += 1
+            mpz_add_ui(b, b, 1); mpz_mod(b, b, group_order);
+            point_add(P, P, Q, c);
+            break;
+    }
 }
 
 
 
-mutex db_mutex;
-unordered_map<string, pair<string, string>> dp_table;
-ofstream save_file;
-bool key_found = false;
-mpz_t final_secret_key;
+
+// Distinguished point
+static constexpr unsigned long DIST_MASK = (1UL << 24) - 1; 
+
+inline bool is_dp(const Point& P) {
+    return !P.is_infinity && (mpz_get_ui(P.x) & DIST_MASK) == 0;
+}
+
+
+mutex              g_mutex;
+unordered_map<string, pair<string,string>> g_table;
+ofstream           g_file;
+atomic<bool>       g_found{false};
+mpz_t              g_key;
+atomic<uint64_t>   g_iters{0};
 
 atomic<unsigned long long> total_iterations(0);
 
-void monitor_thread() {
-    auto start_time = chrono::steady_clock::now();
-    
-    while (!key_found) {
-        this_thread::sleep_for(chrono::milliseconds(5000));
-        if (key_found) break;
 
-        auto now = chrono::steady_clock::now();
-        chrono::duration<double> elapsed = now - start_time;
-        
-        double speed = (elapsed.count() > 0) ? (total_iterations.load() / elapsed.count() / 1000000.0) : 0;
-        
-        size_t current_table_size = 0;
-        {
-            lock_guard<mutex> lock(db_mutex);
-            current_table_size = dp_table.size();
+
+
+void worker(int tid) {
+    Ctx c;
+    Point P, aG, bQ;
+    mpz_t a, b, ac, bc, r, ri, num;
+    mpz_inits(a, b, ac, bc, r, ri, num, NULL);
+
+    gmp_randstate_t rng;
+    gmp_randinit_default(rng);
+    gmp_randseed_ui(rng, (unsigned long)time(nullptr) ^ tid * 6364136223846793005ULL);
+
+    uint64_t local = 0;
+
+    while (!g_found) {
+        // random start: P = a·G + b·Q
+        mpz_urandomm(a, rng, group_order);
+        mpz_urandomm(b, rng, group_order);
+        if (!mpz_sgn(a)) mpz_add_ui(a, a, 1);
+        if (!mpz_sgn(b)) mpz_add_ui(b, b, 1);
+
+        point_mul(aG, G, a, c);
+        point_mul(bQ, Q, b, c);
+        point_add(P, aG, bQ, c);
+
+        // Random walk -> distinguished point
+        while (!g_found) {
+            walk_step(P, a, b, c);
+            ++local;
+
+            if (local % 65536 == 0) {
+                g_iters += 65536; local = 0;
+                if (g_found) break;
+            }
+
+            if (!is_dp(P)) continue;
+
+            // ──  DP ─────────────────────────────────────────────
+            g_iters += local; local = 0;
+            lock_guard<mutex> lk(g_mutex);
+            if (g_found) break;
+
+            char* xs = mpz_get_str(nullptr, 16, P.x);
+            string key(xs); free(xs);
+
+            auto it = g_table.find(key);
+            if (it != g_table.end()) {
+                // collision: P = a·G + b·Q = ac·G + bc·Q
+                // ⟹  (a−ac)·G = (bc−b)·Q
+                // ⟹  k = (a−ac)·(bc−b)⁻¹ mod n
+                mpz_set_str(ac, it->second.first.c_str(),  16);
+                mpz_set_str(bc, it->second.second.c_str(), 16);
+
+                mpz_sub(r, bc, b);  mpz_mod(r, r, group_order);
+                if (mpz_sgn(r) < 0) mpz_add(r, r, group_order);
+
+                if (mpz_sgn(r)) {
+                    mpz_invert(ri, r, group_order);
+                    mpz_sub(num, a, ac); mpz_mod(num, num, group_order);
+                    if (mpz_sgn(num) < 0) mpz_add(num, num, group_order);
+                    mpz_mul(g_key, num, ri);
+                    mpz_mod(g_key, g_key, group_order);
+                    g_found = true;
+                }
+            } else {
+                char* as = mpz_get_str(nullptr, 16, a);
+                char* bs = mpz_get_str(nullptr, 16, b);
+                g_table[key] = {as, bs};
+                g_file << key << ' ' << as << ' ' << bs << '\n';
+                if (g_table.size() % 200 == 0) g_file.flush();
+                free(as); free(bs);
+            }
+            break;  
         }
-
-        cout << "\r      ... completed: " << total_iterations.load() 
-             << " steps | points: " << current_table_size 
-             << " | speed: " << speed << " mill/s ... " << flush;
     }
+
+    g_iters += local;
+    mpz_clears(a, b, ac, bc, r, ri, num, NULL);
+    gmp_randclear(rng);
 }
 
 
-void worker_thread(int thread_id) {
-    ThreadMathContext ctx;
-    Point P, aG, bQ;
-    mpz_t a, b, a_col, b_col, r, r_inv, num;
-    mpz_inits(a, b, a_col, b_col, r, r_inv, num, NULL);
-
-    random_device rd;
-    unsigned long seed = rd() ^ (thread_id * 1000) ^ time(NULL);
-    gmp_randstate_t rand_state;
-    gmp_randinit_default(rand_state);
-    gmp_randseed_ui(rand_state, seed);
 
 
-    unsigned long long local_steps = 0;
-
-
-    while (!key_found) {
-        // random point P = a*G + b*Q
-        mpz_urandomm(a, rand_state, group_order);
-        mpz_urandomm(b, rand_state, group_order);
-        
-        if (mpz_cmp_ui(a, 0) == 0) mpz_add_ui(a, a, 1);
-        if (mpz_cmp_ui(b, 0) == 0) mpz_add_ui(b, b, 1);
-
-        multiply_point(aG, G, a, ctx);
-        multiply_point(bQ, Q, b, ctx);
-        add_points(P, aG, bQ, ctx);
-
-        while (!key_found) {
-            next_step_thread_safe(P, a, b, ctx);
-            
-
-            local_steps++;
-            if (local_steps >= 50000) {
-                total_iterations += local_steps;
-                local_steps = 0;
-            }
-
-
-            if (is_distinguished(P)) {
-                total_iterations += local_steps;
-                local_steps = 0;
-
-
-                lock_guard<mutex> lock(db_mutex);
-                if (key_found) break; 
-
-                char* x_str = mpz_get_str(NULL, 16, P.x);
-                string hash_key(x_str);
-                
-                if (dp_table.count(hash_key)) {
-                    mpz_set_str(a_col, dp_table[hash_key].first.c_str(), 16);
-                    mpz_set_str(b_col, dp_table[hash_key].second.c_str(), 16);
-
-                    // r = (b_col - b) mod N
-                    mpz_sub(r, b_col, b);
-                    mpz_mod(r, r, group_order);
-                    if (mpz_sgn(r) < 0) mpz_add(r, r, group_order);
-
-                    if (mpz_cmp_ui(r, 0) != 0) {
-                        mpz_invert(r_inv, r, group_order);
-
-                        // num = (a - a_col) mod N
-                        mpz_sub(num, a, a_col);
-                        mpz_mod(num, num, group_order);
-                        if (mpz_sgn(num) < 0) mpz_add(num, num, group_order);
-
-                        // result = (num * r_inv) mod N
-                        mpz_mul(final_secret_key, num, r_inv);
-                        mpz_mod(final_secret_key, final_secret_key, group_order);
-                        
-                        key_found = true;
-                    }
-                } else {
-                    char* a_str = mpz_get_str(NULL, 16, a);
-                    char* b_str = mpz_get_str(NULL, 16, b);
-                    
-                    dp_table[hash_key] = {a_str, b_str};
-                    save_file << hash_key << " " << a_str << " " << b_str << "\n";
-                    
-                    if (dp_table.size() % 100 == 0) {
-                        save_file.flush(); 
-                    }
-                    
-                    free(a_str); free(b_str);
-                }
-                free(x_str);
-                
-                break; 
-            }
-        }
+void monitor() {
+    auto t0 = chrono::steady_clock::now();
+    while (!g_found) {
+        this_thread::sleep_for(chrono::seconds(5));
+        if (g_found) break;
+        double sec = chrono::duration<double>(chrono::steady_clock::now()-t0).count();
+        size_t pts; { lock_guard<mutex> lk(g_mutex); pts = g_table.size(); }
+        printf("\r  iters: %llu | DPs: %zu | speed: %.2f M/s   ",
+               (unsigned long long)g_iters.load(), pts,
+               g_iters.load() / sec / 1e6);
+        fflush(stdout);
     }
-
-    total_iterations += local_steps;
-    mpz_clears(a, b, a_col, b_col, r, r_inv, num, NULL);
-    gmp_randclear(rand_state);
 }
 
 
 
 int main() {
-    cout << "============================================================\n";
-    cout << "     Multi-Threaded Pollard's Rho (Van Oorschot-Wiener)\n";
-    cout << "============================================================\n\n";
+    puts("============================================================\n");
+    puts("     Multi-Threaded Pollard's Rho (Van Oorschot-Wiener)\n");
+    puts("============================================================\n\n");
 
-    mpz_inits(curve_a, curve_b, curve_p, group_order, final_secret_key, NULL);
+
+    mpz_inits(curve_a, curve_b, curve_p, group_order, g_key, NULL);
+
+
     mpz_set_str(curve_a, "0", 10);
     mpz_set_str(curve_b, "7", 10);
-    mpz_set_str(curve_p, "115792089237316195423570985008687907853269984665640564039457584007908834671663", 10);
-    mpz_set_str(group_order, "115792089237316195423570985008687907852837564279074904382605163141518161494337", 10);
+    mpz_set_str(curve_p,
+        "115792089237316195423570985008687907853269984665640564039"
+        "457584007908834671663", 10);
+    mpz_set_str(group_order,
+        "115792089237316195423570985008687907852837564279074904382"
+        "605163141518161494337", 10);
 
     G.set_str(
         "55066263022277343669578718895168534326250603453777594175500187360389116729240",
-        "32670510020758816978083085130507043184471273380659243275938904335757337482424"
-    );
-
+        "32670510020758816978083085130507043184471273380659243275938904335757337482424");
     Q.set_str(
         "71715483259960251104886616086749964585141029199321453995874288114660996885376",
-        "40560706241088654877709886733221375330368142163939632832049960868661138127382"
-    );
+        "40560706241088654877709886733221375330368142163939632832049960868661138127382");
 
 
-    ifstream in_file("progress.txt");
-    if (in_file.is_open()) {
-        string x, a, b;
-        while (in_file >> x >> a >> b) {
-            dp_table[x] = {a, b};
+    {
+        ifstream f("progress.txt");
+        if (f) {
+            string x, a, b;
+            while (f >> x >> a >> b) g_table[x] = {a, b};
+            printf("[*] loaded %zu distinguished points\n", g_table.size());
         }
-        in_file.close();
-        cout << "[*] loaded " << dp_table.size() << " points fro progress.txt\n";
     }
-    save_file.open("progress.txt", ios::app);
+    g_file.open("progress.txt", ios::app);
 
-    unsigned int num_cores = thread::hardware_concurrency();
-    if (num_cores == 0) num_cores = 4;
-    cout << "[*] started on " << num_cores << " cores\n";
+    unsigned n = max(1u, thread::hardware_concurrency());
+    printf("[*] launching %u threads\n\n", n);
+
+    thread mon(monitor);
+    vector<thread> pool;
+    pool.reserve(n);
+    for (unsigned i = 0; i < n; ++i) pool.emplace_back(worker, i);
+    for (auto& t : pool) t.join();
+    mon.join();
 
 
-    thread monitor(monitor_thread);
-
-
-   vector<thread> threads;
-    for (unsigned int i = 0; i < num_cores; ++i) {
-        threads.push_back(thread(worker_thread, i));
-    }
-
-    for (auto& th : threads) {
-        th.join();
+    if (g_found) {
+        printf( "\n=========================================\n");
+        gmp_printf("[+] secret key found :\n    k = %Zd\n", g_key);
+        printf( "=========================================\n");
     }
 
-    monitor.join();
+    g_file.flush();
+    g_file.close();
 
-    if (key_found) {
-        cout << "\n=========================================\n";
-        gmp_printf("[+] secret key found :\n    k = %Zd\n", final_secret_key);
-        cout << "=========================================\n";
-    }
-
-    save_file.flush();
-    save_file.close();
-
-    mpz_clears(curve_a, curve_b, curve_p, group_order, final_secret_key, NULL);
+    mpz_clears(curve_a, curve_b, curve_p, group_order, g_key, NULL);
     return 0;
 
 }   
