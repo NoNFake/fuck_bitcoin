@@ -8,6 +8,7 @@
 #include <vector>
 #include <thread>
 #include <mutex>
+#include <shared_mutex>  
 #include <unordered_map>
 #include <random>
 #include <atomic>
@@ -111,24 +112,42 @@ void point_mul(Point& R, const Point& P, const mpz_t k, Ctx& c) {
 
 
 
+
+
+
+static constexpr int PARTITION = 32;
+
+Point precomp[PARTITION];
+mpz_t pr[PARTITION], ps[PARTITION]; // coefficients
+
+
+
 inline void walk_step(Point& P, mpz_t& a, mpz_t& b, Ctx& c) {
-    mpz_fdiv_r_ui(c.sub, P.x, 3);
-    switch (mpz_get_ui(c.sub)) {
-        case 0:  // P += G,  a += 1
-            mpz_add_ui(a, a, 1); mpz_mod(a, a, group_order);
-            point_add(P, P, G, c);
-            break;
-        case 1:  // P *= 2,  a *= 2, b *= 2
-            mpz_mul_ui(a, a, 2); mpz_mod(a, a, group_order);
-            mpz_mul_ui(b, b, 2); mpz_mod(b, b, group_order);
-            point_add(P, P, P, c);
-            break;
-        default: // P += Q,  b += 1
-            mpz_add_ui(b, b, 1); mpz_mod(b, b, group_order);
-            point_add(P, P, Q, c);
-            break;
-    }
+    unsigned idx = mpz_get_ui(P.x) & (PARTITION - 1);
+    mpz_add(a, a, pr[idx]); mpz_mod(a, a, group_order);
+    mpz_add(b, b, ps[idx]); mpz_mod(b, b, group_order);
+    point_add(P, P, precomp[idx], c);
 }
+
+
+// inline void walk_step(Point& P, mpz_t& a, mpz_t& b, Ctx& c) {
+//     mpz_fdiv_r_ui(c.sub, P.x, 3);
+//     switch (mpz_get_ui(c.sub)) {
+//         case 0:  // P += G,  a += 1
+//             mpz_add_ui(a, a, 1); mpz_mod(a, a, group_order);
+//             point_add(P, P, G, c);
+//             break;
+//         case 1:  // P *= 2,  a *= 2, b *= 2
+//             mpz_mul_ui(a, a, 2); mpz_mod(a, a, group_order);
+//             mpz_mul_ui(b, b, 2); mpz_mod(b, b, group_order);
+//             point_add(P, P, P, c);
+//             break;
+//         default: // P += Q,  b += 1
+//             mpz_add_ui(b, b, 1); mpz_mod(b, b, group_order);
+//             point_add(P, P, Q, c);
+//             break;
+//     }
+// }
 
 
 
@@ -181,20 +200,24 @@ void worker(int tid) {
             walk_step(P, a, b, c);
             ++local;
 
-            if (local % 65536 == 0) {
-                g_iters += 65536; local = 0;
-                if (g_found) break;
+            if (local % (1u << 16) == 0) {
+                g_iters += (1u << 16); local = 0;
             }
 
             if (!is_dp(P)) continue;
 
             // ──  DP ─────────────────────────────────────────────
             g_iters += local; local = 0;
+            char* xs = mpz_get_str(nullptr, 16, P.x);
+            string key(xs); free(xs);
+
+            // read lock
+            // {
+            //     sha
+            // }
             lock_guard<mutex> lk(g_mutex);
             if (g_found) break;
 
-            char* xs = mpz_get_str(nullptr, 16, P.x);
-            string key(xs); free(xs);
 
             auto it = g_table.find(key);
             if (it != g_table.end()) {
